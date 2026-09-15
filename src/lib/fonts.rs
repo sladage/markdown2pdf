@@ -186,7 +186,6 @@ pub fn system_font_dirs() -> Vec<String> {
             "/Library/Fonts".to_owned(),
         ]
     } else if cfg!(target_os = "linux") {
-        // enumerate all dirs in /usr/share/fonts
         let dirs = vec![
             "/usr/share/fonts",
             "/usr/local/share/fonts",
@@ -211,13 +210,6 @@ pub fn system_font_dirs() -> Vec<String> {
             })
             .collect();
         all_dirs
-        // vec![
-        //     "/usr/share/fonts/truetype",
-        //     "/usr/share/fonts/TTF",
-        //     "/usr/share/fonts/opentype",
-        //     "/usr/share/fonts",
-        //     "/usr/local/share/fonts",
-        // ]
     } else if cfg!(target_os = "windows") {
         vec!["C:\\Windows\\Fonts".to_owned()]
     } else {
@@ -229,9 +221,7 @@ pub fn system_font_dirs() -> Vec<String> {
 /// matching `name`. Skips `.ttc` (TrueType Collection) files — most
 /// font parsers don't handle them.
 pub fn find_system_font(name: &str) -> Option<PathBuf> {
-    let r = find_system_font_in(name, &system_font_dirs());
-    println!("find_system_font({:?}) -> {:?}", name, r);
-    r
+    find_system_font_in(name, &system_font_dirs())
 }
 
 /// Probe a per-OS list of likely-installed Unicode body fonts and
