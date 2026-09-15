@@ -10,7 +10,7 @@
 //! file backend-agnostic means changing the renderer's font stack
 //! doesn't ripple into the public configuration API.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Specifies where to load a font from.
 #[derive(Debug, Clone)]
@@ -178,29 +178,31 @@ pub fn resolve_font_source(name: &str) -> FontSource {
 }
 
 /// Returns known font directories for the current platform.
-pub fn system_font_dirs() -> Vec<String> {
+pub fn system_font_dirs() -> Vec<PathBuf> {
     if cfg!(target_os = "macos") {
         vec![
-            "/System/Library/Fonts".to_owned(),
-            "/System/Library/Fonts/Supplemental".to_owned(),
-            "/Library/Fonts".to_owned(),
+            "/System/Library/Fonts".into(),
+            "/System/Library/Fonts/Supplemental".into(),
+            "/Library/Fonts".into(),
         ]
     } else if cfg!(target_os = "linux") {
-        let dirs = vec![
-            "/usr/share/fonts",
-            "/usr/local/share/fonts",
-            "$HOME/.fonts",
-            "$HOME/.local/share/fonts",
-        ];
-        let all_dirs: Vec<String> = dirs
+        let mut dirs: Vec<PathBuf> =
+            vec!["/usr/share/fonts".into(), "/usr/local/share/fonts".into()];
+        if let Some(home) = std::env::home_dir() {
+            dirs.append(&mut vec![
+                home.join(".fonts"),
+                home.join(".local/share/fonts"),
+            ]);
+        }
+        let all_dirs: Vec<PathBuf> = dirs
             .iter()
             .flat_map(|d| {
-                [vec![d.to_string()], {
-                    let items: Vec<String> = std::fs::read_dir(d)
+                [vec![d.clone()], {
+                    let items: Vec<PathBuf> = std::fs::read_dir(d)
                         .map(|rd| {
                             rd.filter_map(|entry| entry.ok())
                                 .filter(|entry| entry.path().is_dir())
-                                .map(|entry| entry.path().to_string_lossy().to_string())
+                                .map(|entry| entry.path().clone())
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -211,7 +213,7 @@ pub fn system_font_dirs() -> Vec<String> {
             .collect();
         all_dirs
     } else if cfg!(target_os = "windows") {
-        vec!["C:\\Windows\\Fonts".to_owned()]
+        vec!["C:\\Windows\\Fonts".into()]
     } else {
         vec![]
     }
@@ -267,7 +269,7 @@ pub fn default_body_source() -> Option<FontSource> {
 
 /// `find_system_font` with the search directories injected, so the
 /// matching logic can be exercised against a controlled directory.
-fn find_system_font_in(name: &str, dirs: &[String]) -> Option<PathBuf> {
+fn find_system_font_in(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let name_lower = name.to_lowercase();
     let patterns: Vec<String> = [
         format!("{}.ttf", name),
@@ -286,8 +288,7 @@ fn find_system_font_in(name: &str, dirs: &[String]) -> Option<PathBuf> {
     // than their `X Bold` / `X Italic` siblings).
     //let mut prefix_match: Option<PathBuf> = None;
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for dir in dirs {
-        let dir_path = Path::new(dir);
+    for dir_path in dirs {
         if !dir_path.exists() {
             continue;
         }
@@ -393,7 +394,7 @@ mod tests {
     /// and runs `f` with its path. Cleans up afterwards. The directory
     /// name is made unique with a process-wide atomic counter so the
     /// parallel font tests can't collide on each other's files.
-    fn with_font_dir(files: &[&str], f: impl FnOnce(String)) {
+    fn with_font_dir(files: &[&str], f: impl FnOnce(PathBuf)) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -406,7 +407,7 @@ mod tests {
         for name in files {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
-        f(dir.to_str().unwrap().to_string());
+        f(dir.to_str().unwrap().into());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
