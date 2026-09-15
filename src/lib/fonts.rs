@@ -186,14 +186,26 @@ pub fn system_font_dirs() -> Vec<PathBuf> {
             "/Library/Fonts".into(),
         ]
     } else if cfg!(target_os = "linux") {
-        let mut dirs: Vec<PathBuf> =
-            vec!["/usr/share/fonts".into(), "/usr/local/share/fonts".into()];
-        if let Some(home) = std::env::home_dir() {
-            dirs.append(&mut vec![
-                home.join(".fonts"),
-                home.join(".local/share/fonts"),
-            ]);
+        let mut dirs = vec![
+            PathBuf::from("/usr/share/fonts"),
+            PathBuf::from("/usr/local/share/fonts"),
+        ];
+
+        let home = std::env::home_dir();
+
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+
+        if let Some(data_home) = data_home {
+            dirs.push(data_home.join("fonts"));
         }
+
+        if let Some(home) = home {
+            dirs.push(home.join(".fonts"));
+        }
+
         let all_dirs: Vec<PathBuf> = dirs
             .iter()
             .flat_map(|d| {
