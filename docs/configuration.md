@@ -69,6 +69,41 @@ column_gap_mm = 6.0
 
 A `Mm` margin like `22.6` is millimeters; the renderer converts to PDF points internally.
 
+## Font weights
+
+`font_weight` accepts integers from 100 to 900 or these names:
+
+| Name | Weight |
+| --- | --- |
+| `thin` / `hairline` | 100 |
+| `extra-light` / `ultra-light` | 200 |
+| `light` | 300 |
+| `normal` / `regular` | 400 |
+| `medium` | 500 |
+| `semibold` / `demibold` | 600 |
+| `bold` | 700 |
+| `extra-bold` / `ultra-bold` | 800 |
+| `black` / `heavy` | 900 |
+
+Compound names also accept the joined spelling, such as `extralight`,
+`extrabold`, and `ultrabold`; `semi-bold` and `demi-bold` are accepted too.
+
+For external fonts, put the static weight files in the same directory. For
+example, `Foo-Regular.ttf` can select `Foo-Light.ttf`, `Foo-Medium.ttf`,
+`Foo-Bold.ttf`, and `Foo-Black.ttf`. Discovery ignores capitalization, spaces,
+hyphens, and underscores, and accepts `.ttf` and `.otf`. Italic and oblique
+suffixes are supported, including `Foo-LightItalic.ttf` and `Foo-BoldOblique.ttf`.
+The configured file remains the default face.
+
+Selection prefers the requested slant, then the closest available weight;
+ties select the lighter weight. If no italic face exists, an upright face is
+used. Markdown bold requests at least 700, preserving heavier configured
+weights. This applies to block typography and inline code.
+
+Built-in PDF fonts still offer only regular/bold (600 and above selects bold).
+Raw font bytes have no directory for sibling discovery. This is static-file
+selection; variable-font weight axes and synthetic weights are not supported.
+
 ## Defaults cascade
 
 Every per-block section inherits any unset field from `[defaults]`:
@@ -77,7 +112,7 @@ Every per-block section inherits any unset field from `[defaults]`:
 [defaults]
 font_family = "Helvetica"
 font_size_pt = 11.0
-font_weight = "normal"  # normal | bold | numeric 100..=900
+font_weight = "normal"  # named weight or integer 100..=900
 font_style = "normal"   # normal | italic
 text_color = "#1B1F23"
 line_height = 1.5       # multiplier of font_size_pt

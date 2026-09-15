@@ -49,7 +49,7 @@ pub enum FontVariant {
 impl FontVariant {
     /// Pick the variant that matches a run's [`RunFlags`].
     pub fn for_flags(flags: RunFlags) -> Self {
-        match (flags.monospace, flags.bold, flags.italic) {
+        match (flags.monospace, flags.font_weight() >= 600, flags.italic) {
             (true, true, true) => FontVariant::CourierBoldItalic,
             (true, true, false) => FontVariant::CourierBold,
             (true, false, true) => FontVariant::CourierItalic,
@@ -209,14 +209,7 @@ impl FontMetricsCache {
     }
 }
 
-/// One user-supplied external font, registered with the PDF document.
-///
-/// Holds the printpdf [`FontId`] for emission plus a glyph-width
-/// table for measurement. The font is the same one whether the run
-/// has bold / italic flags or not — synthetic weights aren't faked
-/// today, so bold / italic flags only affect text *color* (when
-/// linked) but not the visual weight when an external font is used.
-/// Per-weight external variants are a phase-8 follow-up.
+/// One external face, with matching metrics and PDF embedding data.
 pub struct ExternalFont {
     pub font_id: FontId,
     units_per_em: u16,
@@ -263,12 +256,8 @@ impl ExternalFont {
 /// The complete font set for one render call: built-ins always
 /// available, plus optional external default-body and code fonts.
 ///
-/// Each external family has up to four weight slots; `regular` is
-/// the anchor (loaded from whatever path the user pointed at), and
-/// the others are discovered by searching sibling files in the
-/// same directory (`Georgia.ttf` -> `Georgia Bold.ttf`,
-/// `Georgia Italic.ttf`, `Georgia Bold Italic.ttf`). Missing slots
-/// fall back to `regular` at resolve time.
+/// External families discover sibling faces by weight and slant. Only
+/// faces selected for requested styles are embedded.
 pub struct FontSet {
     pub builtin: FontMetricsCache,
     pub external_body: ExternalFamily,
@@ -284,40 +273,23 @@ pub struct FontSet {
     pub fallbacks: Vec<ExternalFont>,
 }
 
-/// Up to four weight slots for an external font family.
+/// External family anchored by the configured font file.
 #[derive(Default)]
 pub struct ExternalFamily {
     pub regular: Option<ExternalFont>,
-    pub bold: Option<ExternalFont>,
-    pub italic: Option<ExternalFont>,
-    pub bold_italic: Option<ExternalFont>,
+    pub variants: BTreeMap<(u16, bool), std::sync::Arc<ExternalFont>>,
 }
 
 impl ExternalFamily {
-    /// Best match for the given flags. Falls back through
-    /// bold_italic -> bold -> italic -> regular as variants are
-    /// missing.
     pub fn pick(&self, flags: RunFlags) -> Option<&ExternalFont> {
-        match (flags.bold, flags.italic) {
-            (true, true) => self
-                .bold_italic
-                .as_ref()
-                .or(self.bold.as_ref())
-                .or(self.italic.as_ref())
-                .or(self.regular.as_ref()),
-            (true, false) => self.bold.as_ref().or(self.regular.as_ref()),
-            (false, true) => self.italic.as_ref().or(self.regular.as_ref()),
-            (false, false) => self.regular.as_ref(),
-        }
+        self.variants
+            .get(&(flags.font_weight(), flags.italic))
+            .map(AsRef::as_ref)
+            .or(self.regular.as_ref())
     }
 
-    /// Any external slot is filled — used to decide whether to take
-    /// the external path at all.
     pub fn is_loaded(&self) -> bool {
         self.regular.is_some()
-            || self.bold.is_some()
-            || self.italic.is_some()
-            || self.bold_italic.is_some()
     }
 }
 
@@ -367,11 +339,9 @@ impl FontSet {
     /// Build the font set for a render call.
     ///
     /// `used_codepoints` should be every distinct character that
-    /// appears in the document. `usage` tells us which weight
-    /// variants are actually referenced so we don't embed
-    /// bold/italic/bold-italic faces that the document never asks
-    /// for. Regular is always loaded; the optional weights are
-    /// loaded only when `usage` flags them.
+    /// appears in the document. `usage` includes Markdown emphasis and
+    /// configured typography. Regular is always loaded; other faces
+    /// are embedded only to satisfy the requested weights and slants.
     ///
     /// `extra_fallbacks` is the list of fallback font sources
     /// configured at the document level (`[defaults].fallback_fonts`
@@ -389,6 +359,7 @@ impl FontSet {
             bold: usage.body_bold || usage.body_bold_italic,
             italic: usage.body_italic || usage.body_bold_italic,
             bold_italic: usage.body_bold_italic,
+            weights: usage.body_weights.clone(),
         };
         // Inline-code variants count toward the regular code family
         // too: when `[code_inline].font_family` isn't configured,
@@ -404,6 +375,11 @@ impl FontSet {
                 || usage.inline_code_italic
                 || usage.inline_code_bold_italic,
             bold_italic: usage.mono_bold_italic || usage.inline_code_bold_italic,
+            weights: usage
+                .code_weights
+                .union(&usage.inline_code_weights)
+                .copied()
+                .collect(),
         };
         // Try the user-picked body font first. If that resolves
         // (System name finds a .ttf/.otf, an explicit File path exists,
@@ -427,7 +403,7 @@ impl FontSet {
         let user_src = font_config.and_then(default_source);
         let opted_into_builtin = matches!(&user_src, Some(FontSource::Builtin(_)));
         let external_body =
-            load_external_family(user_src, used_codepoints, body_variants, doc, true)
+            load_external_family(user_src, used_codepoints, body_variants.clone(), doc, true)
                 .or_else(|| {
                     if opted_into_builtin {
                         return None;
@@ -483,12 +459,13 @@ impl FontSet {
         usage: VariantUsage,
         doc: &mut PdfDocument,
     ) -> Self {
-        let mut set = Self::load(font_config, used_codepoints, usage, doc);
+        let mut set = Self::load(font_config, used_codepoints, usage.clone(), doc);
         if let Some(name) = code_inline_name {
             let inline_variants = BodyVariantNeed {
                 bold: usage.inline_code_bold || usage.inline_code_bold_italic,
                 italic: usage.inline_code_italic || usage.inline_code_bold_italic,
                 bold_italic: usage.inline_code_bold_italic,
+                weights: usage.inline_code_weights.clone(),
             };
             set.external_code_inline = load_external_family(
                 Some(name_to_external_source(name)),
@@ -796,13 +773,11 @@ fn resolve_regular(source: FontSource) -> Option<(Option<PathBuf>, Vec<u8>)> {
     }
 }
 
-/// Which weight variants the family loader should bother searching
-/// for and embedding. Regular is always loaded if the family loads
-/// at all; the optional weights are gated by document usage so we
-/// don't embed (typically ~25 KB per variant after subsetting) for
-/// weights the document never references.
-#[derive(Debug, Clone, Copy, Default)]
+/// Weight and slant requests for one family. Regular is always loaded;
+/// additional faces are selected for configured typography and Markdown.
+#[derive(Debug, Clone, Default)]
 pub struct BodyVariantNeed {
+    pub weights: std::collections::BTreeSet<(u16, bool)>,
     pub bold: bool,
     pub italic: bool,
     pub bold_italic: bool,
@@ -835,74 +810,154 @@ fn load_external_family(
     };
 
     if let Some(path) = anchor_path {
-        let candidates: &[(VariantKind, &[&str], bool)] = &[
-            (VariantKind::Bold, &["Bold"], need.bold),
-            (VariantKind::Italic, &["Italic", "Oblique"], need.italic),
-            (
-                VariantKind::BoldItalic,
-                &["Bold Italic", "BoldItalic", "Bold-Italic", "BoldOblique"],
-                need.bold_italic,
-            ),
-        ];
-        for (kind, names, wanted) in candidates {
-            if !wanted {
+        let available = discover_variants(&path);
+        let mut requested = need.weights;
+        requested.insert((400, false));
+        if need.bold {
+            requested.insert((700, false));
+        }
+        if need.italic {
+            requested.insert((400, true));
+        }
+        if need.bold_italic {
+            requested.insert((700, true));
+        }
+        // A face can satisfy several requests. Register it only once.
+        let mut loaded = BTreeMap::<PathBuf, std::sync::Arc<ExternalFont>>::new();
+        for (weight, italic) in requested {
+            let Some(candidate) = select_variant(&available, weight, italic) else {
+                continue;
+            };
+            if candidate == &path {
                 continue;
             }
-            if let Some(variant_path) = find_variant_path(&path, names)
-                && let Some(bytes) = read_font_file(&variant_path)
-                && let Some(parsed) =
-                    parse_and_register(bytes, kind.label(), used_codepoints, doc, false)
+            if !loaded.contains_key(candidate) {
+                let Some(bytes) = read_font_file(candidate) else {
+                    continue;
+                };
+                let Some(font) = parse_and_register(bytes, "variant", used_codepoints, doc, false)
+                else {
+                    continue;
+                };
+                loaded.insert(candidate.clone(), std::sync::Arc::new(font));
+            }
+            family
+                .variants
+                .insert((weight, italic), loaded[candidate].clone());
+        }
+    }
+    Some(family)
+}
+
+/// Filename aliases, longest suffixes first during matching.
+const WEIGHT_NAMES: &[(u16, &[&str])] = &[
+    (100, &["Thin", "Hairline"]),
+    (200, &["ExtraLight", "UltraLight"]),
+    (300, &["Light"]),
+    (400, &["Regular", "Normal", "Roman", "Book"]),
+    (500, &["Medium"]),
+    (600, &["SemiBold", "DemiBold"]),
+    (700, &["Bold"]),
+    (800, &["ExtraBold", "UltraBold"]),
+    (900, &["Black", "Heavy"]),
+];
+
+fn normalized_stem(path: &std::path::Path) -> Option<String> {
+    Some(
+        path.file_stem()?
+            .to_str()?
+            .chars()
+            .filter(|c| !matches!(c, ' ' | '-' | '_'))
+            .flat_map(char::to_lowercase)
+            .collect(),
+    )
+}
+
+/// Separate a family name from a recognized trailing weight and slant.
+/// Thus both Foo-Regular.ttf and FooRegular.ttf anchor the Foo family.
+fn family_stem(stem: &str) -> &str {
+    let upright = stem
+        .strip_suffix("italic")
+        .or_else(|| stem.strip_suffix("oblique"))
+        .unwrap_or(stem);
+    let mut family = upright;
+    for (weight, names) in WEIGHT_NAMES {
+        for name in names
+            .iter()
+            .map(|n| n.to_lowercase())
+            .chain(std::iter::once(weight.to_string()))
+        {
+            if let Some(prefix) = upright.strip_suffix(&name)
+                && !prefix.is_empty()
+                && prefix.len() < family.len()
             {
-                match kind {
-                    VariantKind::Bold => family.bold = Some(parsed),
-                    VariantKind::Italic => family.italic = Some(parsed),
-                    VariantKind::BoldItalic => family.bold_italic = Some(parsed),
+                family = prefix;
+            }
+        }
+    }
+    if family.is_empty() { stem } else { family }
+}
+
+fn discover_variants(anchor: &std::path::Path) -> BTreeMap<(u16, bool), PathBuf> {
+    let mut found = BTreeMap::new();
+    let Some(stem) = normalized_stem(anchor) else {
+        return found;
+    };
+    let family = family_stem(&stem);
+    let parent = anchor
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return found;
+    };
+    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if !path.is_file()
+            || !path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"))
+        {
+            continue;
+        }
+        let Some(stem) = normalized_stem(&path) else {
+            continue;
+        };
+        for &(weight, names) in WEIGHT_NAMES {
+            for name in names
+                .iter()
+                .map(|n| n.to_lowercase())
+                .chain(std::iter::once(weight.to_string()))
+                .chain((weight == 400).then(String::new))
+            {
+                for (slant, italic) in [("", false), ("italic", true), ("oblique", true)] {
+                    if stem == format!("{family}{name}{slant}") {
+                        found
+                            .entry((weight, italic))
+                            .or_insert_with(|| path.clone());
+                    }
                 }
             }
         }
     }
-
-    if family.is_loaded() {
-        Some(family)
-    } else {
-        None
-    }
+    // Preserve explicit file selection as the default face.
+    found.insert((400, false), anchor.to_path_buf());
+    found
 }
 
-#[derive(Clone, Copy)]
-enum VariantKind {
-    Bold,
-    Italic,
-    BoldItalic,
-}
-
-impl VariantKind {
-    fn label(self) -> &'static str {
-        match self {
-            VariantKind::Bold => "bold",
-            VariantKind::Italic => "italic",
-            VariantKind::BoldItalic => "bold-italic",
-        }
-    }
-}
-
-/// Given the regular-weight font's path, return a sibling file
-/// matching one of the variant name patterns
-/// (`Foo Bold.ttf`, `Foo-Bold.ttf`, `FooBold.ttf`, plus `.otf`).
-fn find_variant_path(anchor: &std::path::Path, variant_names: &[&str]) -> Option<PathBuf> {
-    let parent = anchor.parent()?;
-    let stem = anchor.file_stem()?.to_string_lossy().to_string();
-    for variant in variant_names {
-        for sep in [" ", "-", ""] {
-            for ext in ["ttf", "otf"] {
-                let candidate = parent.join(format!("{}{}{}.{}", stem, sep, variant, ext));
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    None
+/// Prefer the requested slant, then the closest weight (lighter wins ties).
+/// If the family has no matching slant, use an upright face.
+fn select_variant(
+    available: &BTreeMap<(u16, bool), PathBuf>,
+    weight: u16,
+    italic: bool,
+) -> Option<&PathBuf> {
+    available
+        .iter()
+        .min_by_key(|((w, i), _)| (*i != italic, w.abs_diff(weight), *w))
+        .map(|(_, path)| path)
 }
 
 /// Invoke `f` once per char that the built-in (Helvetica/Courier)
@@ -1119,6 +1174,48 @@ fn backfill_afm_widths(variant: FontVariant, units_per_em: u16, widths: &mut [u1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn family_suffixes_are_removed_without_truncating_compound_weights() {
+        for name in [
+            "Foo-Regular.ttf",
+            "FooRegular.ttf",
+            "Foo_Regular.OTF",
+            "Foo-ExtraLight.ttf",
+            "Foo-SemiBoldItalic.ttf",
+            "Foo-Black-Oblique.ttf",
+        ] {
+            let stem = normalized_stem(std::path::Path::new(name)).unwrap();
+            assert_eq!(family_stem(&stem), "foo", "{name}");
+        }
+        assert_eq!(family_stem("foo"), "foo");
+    }
+
+    #[test]
+    fn nearest_weight_prefers_slant_then_distance_then_lighter_weight() {
+        let available = BTreeMap::from([
+            ((300, false), PathBuf::from("light")),
+            ((400, false), PathBuf::from("regular")),
+            ((700, false), PathBuf::from("bold")),
+            ((300, true), PathBuf::from("light-italic")),
+        ]);
+        for (weight, italic, expected) in [
+            (350, false, "light"),
+            (550, false, "regular"),
+            (900, false, "bold"),
+            (700, true, "light-italic"),
+        ] {
+            assert_eq!(
+                select_variant(&available, weight, italic).unwrap(),
+                &PathBuf::from(expected)
+            );
+        }
+        let upright = BTreeMap::from([((400, false), PathBuf::from("regular"))]);
+        assert_eq!(
+            select_variant(&upright, 700, true).unwrap(),
+            &PathBuf::from("regular")
+        );
+    }
 
     #[test]
     fn measures_helvetica_width_monotonic_in_text_length() {

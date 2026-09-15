@@ -178,22 +178,48 @@ pub fn resolve_font_source(name: &str) -> FontSource {
 }
 
 /// Returns known font directories for the current platform.
-pub fn system_font_dirs() -> Vec<&'static str> {
+pub fn system_font_dirs() -> Vec<String> {
     if cfg!(target_os = "macos") {
         vec![
-            "/System/Library/Fonts",
-            "/System/Library/Fonts/Supplemental",
-            "/Library/Fonts",
+            "/System/Library/Fonts".to_owned(),
+            "/System/Library/Fonts/Supplemental".to_owned(),
+            "/Library/Fonts".to_owned(),
         ]
     } else if cfg!(target_os = "linux") {
-        vec![
-            "/usr/share/fonts/truetype",
-            "/usr/share/fonts/TTF",
-            "/usr/share/fonts/opentype",
+        // enumerate all dirs in /usr/share/fonts
+        let dirs = vec![
+            "/usr/share/fonts",
             "/usr/local/share/fonts",
-        ]
+            "$HOME/.fonts",
+            "$HOME/.local/share/fonts",
+        ];
+        let all_dirs: Vec<String> = dirs
+            .iter()
+            .flat_map(|d| {
+                [vec![d.to_string()], {
+                    let items: Vec<String> = std::fs::read_dir(d)
+                        .map(|rd| {
+                            rd.filter_map(|entry| entry.ok())
+                                .filter(|entry| entry.path().is_dir())
+                                .map(|entry| entry.path().to_string_lossy().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    items
+                }]
+                .concat()
+            })
+            .collect();
+        all_dirs
+        // vec![
+        //     "/usr/share/fonts/truetype",
+        //     "/usr/share/fonts/TTF",
+        //     "/usr/share/fonts/opentype",
+        //     "/usr/share/fonts",
+        //     "/usr/local/share/fonts",
+        // ]
     } else if cfg!(target_os = "windows") {
-        vec!["C:\\Windows\\Fonts"]
+        vec!["C:\\Windows\\Fonts".to_owned()]
     } else {
         vec![]
     }
@@ -203,7 +229,9 @@ pub fn system_font_dirs() -> Vec<&'static str> {
 /// matching `name`. Skips `.ttc` (TrueType Collection) files — most
 /// font parsers don't handle them.
 pub fn find_system_font(name: &str) -> Option<PathBuf> {
-    find_system_font_in(name, &system_font_dirs())
+    let r = find_system_font_in(name, &system_font_dirs());
+    println!("find_system_font({:?}) -> {:?}", name, r);
+    r
 }
 
 /// Probe a per-OS list of likely-installed Unicode body fonts and
@@ -249,7 +277,7 @@ pub fn default_body_source() -> Option<FontSource> {
 
 /// `find_system_font` with the search directories injected, so the
 /// matching logic can be exercised against a controlled directory.
-fn find_system_font_in(name: &str, dirs: &[&str]) -> Option<PathBuf> {
+fn find_system_font_in(name: &str, dirs: &[String]) -> Option<PathBuf> {
     let name_lower = name.to_lowercase();
     let patterns: Vec<String> = [
         format!("{}.ttf", name),
@@ -266,7 +294,8 @@ fn find_system_font_in(name: &str, dirs: &[&str]) -> Option<PathBuf> {
     // an exact match first; only if none exists fall back to the
     // shortest-named prefix match (regular faces have shorter names
     // than their `X Bold` / `X Italic` siblings).
-    let mut prefix_match: Option<PathBuf> = None;
+    //let mut prefix_match: Option<PathBuf> = None;
+    let mut candidates: Vec<PathBuf> = Vec::new();
     for dir in dirs {
         let dir_path = Path::new(dir);
         if !dir_path.exists() {
@@ -290,19 +319,32 @@ fn find_system_font_in(name: &str, dirs: &[&str]) -> Option<PathBuf> {
             if file_lower.starts_with(&name_lower)
                 && (file_lower.ends_with(".ttf") || file_lower.ends_with(".otf"))
             {
-                let shorter = prefix_match
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| file_lower.len() < n.to_string_lossy().len())
-                    .unwrap_or(true);
-                if shorter {
-                    prefix_match = Some(entry.path());
-                }
+                candidates.push(entry.path());
             }
         }
     }
 
-    prefix_match
+    match candidates.len() {
+        0 => None,
+        1 => Some(candidates.remove(0)),
+        _ => {
+            // multiple matches, check if we have one that contains "regular" in the name
+            let regular_match = candidates.iter().find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("regular")
+            });
+            if let Some(regular) = regular_match {
+                Some(regular.clone())
+            } else {
+                // otherwise return the shortest match
+                candidates.sort_by_key(|p| p.file_name().unwrap().to_string_lossy().len());
+                Some(candidates.remove(0))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,7 +403,7 @@ mod tests {
     /// and runs `f` with its path. Cleans up afterwards. The directory
     /// name is made unique with a process-wide atomic counter so the
     /// parallel font tests can't collide on each other's files.
-    fn with_font_dir(files: &[&str], f: impl FnOnce(&str)) {
+    fn with_font_dir(files: &[&str], f: impl FnOnce(String)) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -374,7 +416,7 @@ mod tests {
         for name in files {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
-        f(dir.to_str().unwrap());
+        f(dir.to_str().unwrap().to_string());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

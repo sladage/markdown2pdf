@@ -294,3 +294,158 @@ fn fallback_font_loads_when_system_font_available() {
         "expected at least one embedded font (the fallback) with an `/Ascent` entry, got none"
     );
 }
+
+/// Real, deterministic font files without depending on host-installed fonts.
+struct WeightFixtures(std::path::PathBuf);
+
+impl WeightFixtures {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mdp-weights-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+    fn write(&self, name: &str, font: printpdf::BuiltinFont) -> std::path::PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, font.get_subset_font().bytes).unwrap();
+        path
+    }
+}
+impl Drop for WeightFixtures {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read the advance of the first emitted glyph from the actual embedded face.
+fn first_emitted_advance(bytes: &[u8]) -> f32 {
+    let mut doc = lopdf::Document::load_mem(bytes).unwrap();
+    doc.decompress();
+    let page = *doc.get_pages().values().next().unwrap();
+    let fonts = doc.get_page_fonts(page).unwrap();
+    let content = lopdf::content::Content::decode(&doc.get_page_content(page)).unwrap();
+    let mut current = None;
+    for op in content.operations {
+        if op.operator == "Tf" {
+            current = Some(op.operands[0].as_name().unwrap().to_vec());
+        }
+        if op.operator == "Tj" {
+            let font = fonts[&current.unwrap()];
+            let descendant = doc
+                .dereference(&font.get(b"DescendantFonts").unwrap().as_array().unwrap()[0])
+                .unwrap()
+                .1
+                .as_dict()
+                .unwrap();
+            let descriptor = doc
+                .dereference(descendant.get(b"FontDescriptor").unwrap())
+                .unwrap()
+                .1
+                .as_dict()
+                .unwrap();
+            let stream = doc
+                .dereference(descriptor.get(b"FontFile2").unwrap())
+                .unwrap()
+                .1
+                .as_stream()
+                .unwrap();
+            let face = ttf_parser::Face::parse(&stream.content, 0).unwrap();
+            let encoded = op.operands[0].as_str().unwrap();
+            let gid = ttf_parser::GlyphId(u16::from_be_bytes([encoded[0], encoded[1]]));
+            return f32::from(face.glyph_hor_advance(gid).unwrap())
+                / f32::from(face.units_per_em());
+        }
+    }
+    panic!("no emitted glyph");
+}
+
+fn expected_advance(font: printpdf::BuiltinFont) -> f32 {
+    let bytes = font.get_subset_font().bytes;
+    let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
+    f32::from(
+        face.glyph_hor_advance(face.glyph_index('A').unwrap())
+            .unwrap(),
+    ) / f32::from(face.units_per_em())
+}
+
+#[test]
+fn configured_weights_select_real_sibling_faces_in_pdf() {
+    use printpdf::BuiltinFont as B;
+    let fixtures = WeightFixtures::new();
+    let anchor = fixtures.write("Foo-Regular.ttf", B::Helvetica);
+    let cases = [
+        ("thin", 100, "Foo-Thin.ttf", B::Courier),
+        ("extra-light", 200, "Foo_Extra_Light.OTF", B::TimesRoman),
+        ("light", 300, "Foo Light.ttf", B::TimesItalic),
+        ("normal", 400, "Foo-Regular.ttf", B::Helvetica),
+        ("medium", 500, "FooMedium.ttf", B::TimesBold),
+        ("semibold", 600, "Foo-SemiBold.ttf", B::TimesBoldItalic),
+        ("bold", 700, "Foo-Bold.ttf", B::HelveticaBold),
+        ("extra-bold", 800, "Foo-ExtraBold.ttf", B::HelveticaOblique),
+        ("black", 900, "Foo-Black.ttf", B::HelveticaBoldOblique),
+    ];
+    for &(_, _, name, font) in &cases {
+        fixtures.write(name, font);
+    }
+    let cfg = FontConfig::new()
+        .with_default_font_source(FontSource::file(&anchor))
+        .with_code_font_source(FontSource::file(&anchor));
+    for (name, numeric, _, font) in cases {
+        for value in [format!("\"{name}\""), numeric.to_string()] {
+            for (section, md) in [
+                ("paragraph", "A"),
+                ("code_block", "```\nA\n```"),
+                ("code_inline", "`A`"),
+            ] {
+                let toml = format!("[{section}]\nfont_weight = {value}");
+                let bytes =
+                    parse_into_bytes(md.to_string(), ConfigSource::Embedded(&toml), Some(&cfg))
+                        .unwrap();
+                assert_eq!(
+                    first_emitted_advance(&bytes),
+                    expected_advance(font),
+                    "{section} weight {value}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn weighted_italic_and_markdown_bold_select_matching_faces() {
+    use printpdf::BuiltinFont as B;
+    let fixtures = WeightFixtures::new();
+    let anchor = fixtures.write("Foo-Regular.ttf", B::Helvetica);
+    fixtures.write("Foo-Light.ttf", B::TimesRoman);
+    fixtures.write("foo_light_italic.TTF", B::TimesItalic);
+    fixtures.write("Foo-Bold.ttf", B::HelveticaBold);
+    fixtures.write("Foo-BoldOblique.ttf", B::HelveticaBoldOblique);
+    let cfg = FontConfig::new().with_default_font_source(FontSource::file(anchor));
+    for (md, style, font) in [
+        ("*A*", "font_weight = 300", B::TimesItalic),
+        (
+            "A",
+            "font_weight = 300\nfont_style = \"italic\"",
+            B::TimesItalic,
+        ),
+        ("**A**", "font_weight = 300", B::HelveticaBold),
+        ("***A***", "font_weight = 300", B::HelveticaBoldOblique),
+        // Missing medium matches regular; missing black matches bold.
+        ("A", "font_weight = 500", B::Helvetica),
+        ("A", "font_weight = 900", B::HelveticaBold),
+    ] {
+        let toml = format!("[paragraph]\n{style}");
+        let bytes =
+            parse_into_bytes(md.to_string(), ConfigSource::Embedded(&toml), Some(&cfg)).unwrap();
+        assert_eq!(
+            first_emitted_advance(&bytes),
+            expected_advance(font),
+            "{md}: {style}"
+        );
+    }
+}
