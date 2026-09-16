@@ -322,8 +322,8 @@ impl Drop for WeightFixtures {
     }
 }
 
-/// Read the advance of the first emitted glyph from the actual embedded face.
-fn first_emitted_advance(bytes: &[u8]) -> f32 {
+/// PostScript name of the embedded face that draws the first glyph.
+fn first_emitted_face(bytes: &[u8]) -> String {
     let mut doc = lopdf::Document::load_mem(bytes).unwrap();
     doc.decompress();
     let page = *doc.get_pages().values().next().unwrap();
@@ -354,23 +354,23 @@ fn first_emitted_advance(bytes: &[u8]) -> f32 {
                 .1
                 .as_stream()
                 .unwrap();
-            let face = ttf_parser::Face::parse(&stream.content, 0).unwrap();
-            let encoded = op.operands[0].as_str().unwrap();
-            let gid = ttf_parser::GlyphId(u16::from_be_bytes([encoded[0], encoded[1]]));
-            return f32::from(face.glyph_hor_advance(gid).unwrap())
-                / f32::from(face.units_per_em());
+            return postscript_name(&stream.content);
         }
     }
     panic!("no emitted glyph");
 }
 
-fn expected_advance(font: printpdf::BuiltinFont) -> f32 {
-    let bytes = font.get_subset_font().bytes;
-    let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
-    f32::from(
-        face.glyph_hor_advance(face.glyph_index('A').unwrap())
-            .unwrap(),
-    ) / f32::from(face.units_per_em())
+fn postscript_name(font_bytes: &[u8]) -> String {
+    let face = ttf_parser::Face::parse(font_bytes, 0).unwrap();
+    face.names()
+        .into_iter()
+        .filter(|n| n.name_id == ttf_parser::name_id::POST_SCRIPT_NAME)
+        .find_map(|n| n.to_string())
+        .expect("fixture face has a PostScript name")
+}
+
+fn expected_face(font: printpdf::BuiltinFont) -> String {
+    postscript_name(&font.get_subset_font().bytes)
 }
 
 #[test]
@@ -407,8 +407,8 @@ fn configured_weights_select_real_sibling_faces_in_pdf() {
                     parse_into_bytes(md.to_string(), ConfigSource::Embedded(&toml), Some(&cfg))
                         .unwrap();
                 assert_eq!(
-                    first_emitted_advance(&bytes),
-                    expected_advance(font),
+                    first_emitted_face(&bytes),
+                    expected_face(font),
                     "{section} weight {value}"
                 );
             }
@@ -443,9 +443,83 @@ fn weighted_italic_and_markdown_bold_select_matching_faces() {
         let bytes =
             parse_into_bytes(md.to_string(), ConfigSource::Embedded(&toml), Some(&cfg)).unwrap();
         assert_eq!(
-            first_emitted_advance(&bytes),
-            expected_advance(font),
+            first_emitted_face(&bytes),
+            expected_face(font),
             "{md}: {style}"
+        );
+    }
+}
+
+fn render_with(md: &str, toml: &str, cfg: &FontConfig) -> Vec<u8> {
+    parse_into_bytes(md.to_string(), ConfigSource::Embedded(toml), Some(cfg)).unwrap()
+}
+
+#[test]
+fn bold_faces_are_found_for_family_names_ending_in_weight_words() {
+    use printpdf::BuiltinFont as B;
+    let fixtures = WeightFixtures::new();
+    let anchor = fixtures.write("Serif Roman.ttf", B::TimesRoman);
+    fixtures.write("Serif Roman Bold.ttf", B::TimesBold);
+    fixtures.write("Serif Roman Italic.ttf", B::TimesItalic);
+    let cfg = FontConfig::new().with_default_font_source(FontSource::file(anchor));
+    for (md, font) in [
+        ("A", B::TimesRoman),
+        ("# A", B::TimesBold),
+        ("**A**", B::TimesBold),
+        ("*A*", B::TimesItalic),
+    ] {
+        assert_eq!(
+            first_emitted_face(&render_with(md, "", &cfg)),
+            expected_face(font),
+            "{md}"
+        );
+    }
+}
+
+#[test]
+fn bold_never_resolves_lighter_than_a_heavy_configured_face() {
+    use printpdf::BuiltinFont as B;
+    let fixtures = WeightFixtures::new();
+    fixtures.write("Sans.ttf", B::Helvetica);
+    fixtures.write("Sans Bold.ttf", B::HelveticaBold);
+    let anchor = fixtures.write("Sans Black.ttf", B::TimesBold);
+    let cfg = FontConfig::new().with_default_font_source(FontSource::file(anchor));
+    for md in ["A", "**A**", "# A"] {
+        assert_eq!(
+            first_emitted_face(&render_with(md, "", &cfg)),
+            expected_face(B::TimesBold),
+            "{md}"
+        );
+    }
+}
+
+#[test]
+fn inline_code_inherits_block_weight_unless_configured() {
+    use printpdf::BuiltinFont as B;
+    let fixtures = WeightFixtures::new();
+    let body = fixtures.write("Body.ttf", B::Helvetica);
+    fixtures.write("Body Bold.ttf", B::HelveticaBold);
+    let mono = fixtures.write("Mono.ttf", B::Courier);
+    fixtures.write("Mono Light.ttf", B::CourierOblique);
+    fixtures.write("Mono Bold.ttf", B::CourierBold);
+    let cfg = FontConfig::new()
+        .with_default_font_source(FontSource::file(body))
+        .with_code_font_source(FontSource::file(mono));
+    for (md, toml, font) in [
+        ("`A`", "", B::Courier),
+        ("# `A`", "", B::CourierBold),
+        ("**`A`**", "", B::CourierBold),
+        ("`A`", "[paragraph]\nfont_weight = \"bold\"", B::CourierBold),
+        (
+            "# `A`",
+            "[code_inline]\nfont_weight = \"light\"",
+            B::CourierOblique,
+        ),
+    ] {
+        assert_eq!(
+            first_emitted_face(&render_with(md, toml, &cfg)),
+            expected_face(font),
+            "{md}: {toml}"
         );
     }
 }

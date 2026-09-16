@@ -230,15 +230,26 @@ impl VariantUsage {
             self.mono_bold || self.mono_bold_italic,
             self.mono_italic || self.mono_bold_italic,
         );
-        // Inline code can inherit italic styling from its surrounding block.
-        let body_italic = self.body_weights.iter().any(|(_, italic)| *italic);
-        add_style_weights(
-            &mut self.inline_code_weights,
-            style.code_inline.font_weight.numeric(),
-            style.code_inline.is_italic(),
-            self.inline_code_bold || self.inline_code_bold_italic,
-            self.inline_code_italic || self.inline_code_bold_italic || body_italic,
-        );
+        // Inline code takes its slant, and with a normal
+        // `[code_inline].font_weight` its weight, from the surrounding
+        // block, so it can need any weight the body text uses.
+        let code_weight = style.code_inline.font_weight.numeric();
+        let code_italic = style.code_inline.is_italic();
+        let bold_runs = self.inline_code_bold || self.inline_code_bold_italic;
+        let surrounding: Vec<_> = self.body_weights.iter().copied().collect();
+        for (weight, italic) in surrounding {
+            add_style_weights(
+                &mut self.inline_code_weights,
+                if code_weight == 400 {
+                    weight
+                } else {
+                    code_weight
+                },
+                italic || code_italic,
+                bold_runs,
+                self.inline_code_italic || self.inline_code_bold_italic,
+            );
+        }
     }
 
     pub fn analyze(blocks: &[Block]) -> Self {

@@ -857,10 +857,17 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Merge a run's flags with its block's base style, then apply
+    /// `[code_inline]` typography to inline code. A normal
+    /// `[code_inline].font_weight` inherits the surrounding weight, so
+    /// code in a bold heading stays bold.
     fn styled_run_flags(&self, flags: RunFlags, base: RunFlags) -> RunFlags {
         let mut flags = flags.or(base);
         if flags.inline_code && !self.in_code_block {
-            flags.weight = Some(self.style.code_inline.font_weight.numeric());
+            let weight = self.style.code_inline.font_weight.numeric();
+            if weight != 400 {
+                flags.weight = Some(weight);
+            }
             flags.italic |= self.style.code_inline.is_italic();
         }
         flags
